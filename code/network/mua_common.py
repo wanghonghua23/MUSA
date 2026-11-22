@@ -1,22 +1,12 @@
 """FC loading and the original MUSA MLP classifier."""
 
-import gzip
 import os
 
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
-from scipy.io import loadmat
-from sklearn.metrics import (
-    accuracy_score,
-    confusion_matrix,
-    f1_score,
-    precision_score,
-    recall_score,
-    roc_auc_score,
-)
+from sklearn.metrics import accuracy_score
 from sklearn.preprocessing import StandardScaler
 
 
@@ -35,63 +25,6 @@ def set_global_seed(random_state: int):
         uda = getattr(torch, "use_deterministic_algorithms", None)
         if uda is not None:
             uda(True, warn_only=True)
-
-def load_fc_matrices(script_dir, file_list):
-    # Load .mat / .mat.gz from FC_matrices by file_list stem -> [N,116,116]
-    fc_dir = os.path.join(script_dir, 'FC_matrices')
-    if not os.path.exists(fc_dir):
-        raise FileNotFoundError(f"FC matrices directory not found: {fc_dir}")
-
-    # Convention: FC matrix field name in .mat files is fixed to this key
-    _FC_MAT_KEY = "FC"
-    
-    fc_matrices = []
-    for file_path in file_list:
-        filename = os.path.basename(str(file_path).replace('\\', '/'))
-        
-        # Extract file stem (strip extension)
-        if filename.endswith('.nii.gz'):
-            stem = filename[:-7]
-        elif filename.endswith('.nii'):
-            stem = filename[:-4]
-        else:
-            stem, _ = os.path.splitext(filename)
-        
-        fc_file = os.path.join(fc_dir, f"{stem}.mat")
-        if not os.path.exists(fc_file):
-            fc_file = os.path.join(fc_dir, f"{stem}.mat.gz")
-        
-        if not os.path.exists(fc_file):
-            raise FileNotFoundError(
-                f"FC matrix file not found for sample ID: {stem}\n"
-                f"Tried: {os.path.join(fc_dir, f'{stem}.mat')} and {os.path.join(fc_dir, f'{stem}.mat.gz')}\n"
-                f"Please verify FC matrix files exist."
-            )
-        
-        if fc_file.endswith('.gz'):
-            with gzip.open(fc_file, 'rb') as f:
-                mat_data = loadmat(f)
-        else:
-            mat_data = loadmat(fc_file)
-
-        if _FC_MAT_KEY not in mat_data:
-            raise ValueError(
-                f"FC matrix file missing key={_FC_MAT_KEY!r}, file: {fc_file}\n"
-                f"Keys in file: {list(mat_data.keys())}"
-            )
-        fc_matrix = mat_data[_FC_MAT_KEY]
-
-        if fc_matrix.shape != (116, 116):
-            raise ValueError(
-                f"FC matrix shape incorrect, expected (116, 116), got {fc_matrix.shape}, file: {fc_file}\n"
-                f"Please verify FC matrix dimensions."
-            )
-
-        fc_matrices.append(fc_matrix.astype(np.float32))
-    
-    fc_matrices = np.array(fc_matrices)
-    return fc_matrices
-
 
 class MLPClassifier(nn.Module):
     # Fully connected layers + BN + ReLU + Dropout
@@ -131,7 +64,7 @@ def flatten_and_classify_mlp(features, labels, train_indices, test_indices, meth
     input_dim = features_flat.shape[1]
     
     scaler = StandardScaler()
-    features_normalized = scaler.fit_transform(features_flat[train_indices])
+    scaler.fit(features_flat[train_indices])
     features_normalized = scaler.transform(features_flat)
     
     if val_indices is not None:
@@ -176,9 +109,6 @@ def flatten_and_classify_mlp(features, labels, train_indices, test_indices, meth
     
     model.train()
     best_val_loss = float('inf')
-    best_val_acc = 0.0
-    best_val_f1 = 0.0
-    best_val_auc = 0.0
     patience_counter = 0
     best_state = None
     best_checkpoint = None
@@ -208,18 +138,12 @@ def flatten_and_classify_mlp(features, labels, train_indices, test_indices, meth
             val_loss = criterion(val_outputs, y_val)
             val_loss_val = val_loss.item()
             val_pred = val_outputs.argmax(dim=1).cpu().numpy()
-            val_probs = torch.softmax(val_outputs, dim=1)[:, 1].cpu().numpy()
             val_acc = accuracy_score(y_val.cpu().numpy(), val_pred)
-            val_f1 = f1_score(y_val.cpu().numpy(), val_pred)
-            val_auc = roc_auc_score(y_val.cpu().numpy(), val_probs)
         
         improved = val_loss_val < best_val_loss - early_stop_min_delta
         if improved:
             best_val_loss = val_loss_val
-            best_val_acc = val_acc
-            best_val_f1 = val_f1
-            best_val_auc = val_auc
-            patience_counter = 0
+                                    patience_counter = 0
             best_state = {
                 'model': model.state_dict(),
                 'optimizer': optimizer.state_dict(),
@@ -227,8 +151,6 @@ def flatten_and_classify_mlp(features, labels, train_indices, test_indices, meth
                 'epoch': epoch + 1,
                 'val_loss': val_loss_val,
                 'val_acc': val_acc,
-                'val_f1': val_f1,
-                'val_auc': val_auc,
             }
         else:
             patience_counter += 1
@@ -248,75 +170,11 @@ def flatten_and_classify_mlp(features, labels, train_indices, test_indices, meth
         model.train()
     
     if best_checkpoint is not None:
-        model.load_state_dict(best_checkpoint['model'])
-        
-        model.eval()
-        with torch.no_grad():
-            test_outputs = model(X_test)
-            test_probs = torch.softmax(test_outputs, dim=1)
-            y_pred_test = test_outputs.argmax(dim=1).cpu().numpy()
-            y_prob_test = test_probs[:, 1].cpu().numpy()
-        
-        test_acc = accuracy_score(y_test, y_pred_test)
-        f1 = f1_score(y_test, y_pred_test)
-        auc = roc_auc_score(y_test, y_prob_test)
-        
-        cm = confusion_matrix(y_test, y_pred_test)
-        precision = precision_score(y_test, y_pred_test, average='binary', zero_division=0)
-        recall = recall_score(y_test, y_pred_test, average='binary', zero_division=0)
-        
-        if cm.shape == (2, 2):
-            tn, fp, fn, tp = cm.ravel()
-            specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0
-        else:
-            specificity = 0.0
-        
-        return model, test_acc, f1, auc, {
-            'accuracy': float(test_acc),
-            'sensitivity': float(recall),
-            'specificity': float(specificity),
-            'precision': float(precision),
-            'f1': float(f1),
-            'auc': float(auc) if auc is not None else None,
-            'confusion_matrix': cm.tolist() if isinstance(cm, np.ndarray) else cm,
-            'predicted_labels': y_pred_test.tolist(),
-            'mdd_probabilities': y_prob_test.tolist()
-        }
-    else:
-        if best_state is not None:
-            model.load_state_dict(best_state['model'])
-    
+        model.load_state_dict(best_checkpoint["model"])
+    elif best_state is not None:
+        model.load_state_dict(best_state["model"])
+
     model.eval()
     with torch.no_grad():
-        test_outputs = model(X_test)
-        test_probs = torch.softmax(test_outputs, dim=1)
-        y_pred_test = test_outputs.argmax(dim=1).cpu().numpy()
-        y_prob_test = test_probs[:, 1].cpu().numpy()
-    
-    test_acc = accuracy_score(y_test, y_pred_test)
-    f1 = f1_score(y_test, y_pred_test)
-    auc = roc_auc_score(y_test, y_prob_test)
-    
-    cm = confusion_matrix(y_test, y_pred_test)
-    precision = precision_score(y_test, y_pred_test, average='binary', zero_division=0)
-    recall = recall_score(y_test, y_pred_test, average='binary', zero_division=0)
-    
-    if cm.shape == (2, 2):
-        tn, fp, fn, tp = cm.ravel()
-        specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0
-    else:
-        specificity = 0.0
-    
-    return model, test_acc, f1, auc, {
-        'accuracy': float(test_acc),
-        'sensitivity': float(recall),
-        'specificity': float(specificity),
-        'precision': float(precision),
-        'f1': float(f1),
-        'auc': float(auc) if auc is not None else None,
-        'confusion_matrix': cm.tolist() if isinstance(cm, np.ndarray) else cm,
-            'predicted_labels': y_pred_test.tolist(),
-            'mdd_probabilities': y_prob_test.tolist()
-    }
-
-
+        predicted_labels = model(X_test).argmax(dim=1).cpu().numpy()
+    return float(accuracy_score(y_test, predicted_labels))
