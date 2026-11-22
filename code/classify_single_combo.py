@@ -1,207 +1,100 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-# MUSA single-combination classification
+"""Train and evaluate MUSA from saved features."""
 
-import os
-import sys
-
-CODE_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = os.path.dirname(CODE_DIR)
-sys.path.insert(0, CODE_DIR)
-
+import argparse
+import csv
 import json
+import os
 from datetime import datetime
+from pathlib import Path
 
 import numpy as np
 import torch
 from sklearn.model_selection import StratifiedKFold
-from data_split_and_paths import SCRIPT_DIR, FEATURE_DIR, RESULT_DIR, load_saved_data_split_only
-from network.mua_common import (
-    load_fc_matrices,
-    flatten_and_classify_mlp,
-    set_global_seed,
-)
-from extract_roi_vit_features import (
-    extract_smri_all_channels_vit_features,
-    extract_fmri_all_channels_vit_features,
-    fmri_vit_features_cache_ready,
-)
 
-# Default experiment hyperparameters
-default_channels                 = ["WM","FC","ReHo","DC"]
-default_combination_name         = "WM+FC+ReHo+DC"
-default_random_state             = 42
-default_cv_folds                 = 5
-default_force_recompute_features = False
-holdout_test_size                = 0.2
+from network.mua_common import load_fc_matrices, flatten_and_classify_mlp, set_global_seed
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+RESULT_DIR = PROJECT_ROOT / "results"
+CHANNEL_FILES = {
+    "GM": "smri_GM_vit_features.npy",
+    "WM": "smri_WM_vit_features.npy",
+    "CSF": "smri_CSF_vit_features.npy",
+    "ReHo": "fmri_ReHo_vit_features.npy",
+    "DC": "fmri_DC_vit_features.npy",
+    "ALFF": "fmri_ALFF_vit_features.npy",
+    "VMHC": "fmri_VMHC_vit_features.npy",
+}
+
+
+def load_inputs(data_dir, feature_dir, fused_features, channels):
+    labels = np.load(data_dir / "labels.npy")
+    # Original split cache stores a pickled dict. Use only trusted project files.
+    split = np.load(data_dir / "data_split.npy", allow_pickle=True).item()
+    train, test = split["train_indices"], split["test_indices"]
+    if labels.ndim != 1 or not np.array_equal(np.unique(labels), [0, 1]):
+        raise ValueError("labels.npy must contain one binary label per sample (HC=0, MDD=1).")
+    if any(idx.ndim != 1 or idx.dtype.kind not in "iu" for idx in (train, test)):
+        raise ValueError("Split indices must be one-dimensional integer arrays.")
+    if not np.array_equal(np.sort(np.concatenate((train, test))), np.arange(len(labels))):
+        raise ValueError("Train/test split must partition all feature rows without overlap.")
+    if any(np.unique(labels[idx]).size != 2 for idx in (train, test)):
+        raise ValueError("Both train and test must contain HC and MDD samples.")
+
+    sample_ids = np.arange(len(labels))
+    file_list_path = data_dir / "file_list.npy"
+    if file_list_path.is_file() or (fused_features is None and "FC" in channels):
+        file_list = np.load(file_list_path, allow_pickle=True)
+        if file_list.shape != labels.shape:
+            raise ValueError("file_list.npy must contain one original filename per feature row.")
+        sample_ids = [str(p).replace("\\", "/").split("/")[-1].removesuffix(".gz").removesuffix(".nii")
+                      for p in file_list]
+
+    if fused_features is not None:
+        features = np.load(fused_features, mmap_mode="r")
+        if (features.ndim not in (2, 3) or features.shape[0] != len(labels)
+                or features.shape[-1] == 0 or (features.ndim == 3 and features.shape[1] != 116)
+                or features.dtype.kind not in "fiu"):
+            raise ValueError("Fused features must be numeric with shape [N,D] or [N,116,D].")
+    else:
+        arrays = []
+        for ch in channels:
+            values = (load_fc_matrices(data_dir, file_list) if ch == "FC"
+                      else np.load(feature_dir / CHANNEL_FILES[ch], mmap_mode="r"))
+            if (values.ndim != 3 or values.shape[:2] != (len(labels), 116)
+                    or values.shape[2] == 0 or values.dtype.kind not in "fiu"):
+                raise ValueError(f"{ch} features must be numeric with shape [N,116,D].")
+            arrays.append(values)
+        features = np.concatenate(arrays, axis=2)
+    return features, labels, train, test, sample_ids, int(split["random_state"])
 
 
 def main():
-    print("=" * 70)
-    print("MUSA Single-Combination Classification")
-    print("=" * 70)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--features", type=Path, help="Fused .npy file. Overrides channel cache loading.")
+    parser.add_argument("--feature-dir", type=Path, default=PROJECT_ROOT / "3dvit_features")
+    parser.add_argument("--data-dir", type=Path, default=PROJECT_ROOT / "data")
+    parser.add_argument("--channels", nargs="+", choices=[*CHANNEL_FILES, "FC"],
+                        default=["WM", "FC", "ReHo", "DC"])
+    args = parser.parse_args()
+    if len(set(args.channels)) != len(args.channels):
+        parser.error("--channels must not contain duplicates")
+    run_classification_experiment(args.channels, args.data_dir, args.feature_dir, args.features)
 
-    run_classification_experiment(
-        selected_channels=list(default_channels),
-        combination_name=default_combination_name,
-        random_state=default_random_state,
-        cv_folds=default_cv_folds,
-        force_recompute_features=default_force_recompute_features,
+
+def run_classification_experiment(selected_channels, data_dir, feature_dir, fused_features=None):
+    concatenated, labels, train_indices, test_indices, sample_ids, random_state = load_inputs(
+        data_dir, feature_dir, fused_features, selected_channels
     )
-
-
-# Helper functions
-
-def concatenate_selected_channels(
-    smri_channels_dict,
-    fc_matrices,
-    fmri_channels_dict,
-    selected_channels,
-    include_fc=True,
-):
-    # Concatenate sMRI / FC / fMRI features along last dim in selected_channels order -> [N,116,D]
-    if fc_matrices is None and "FC" in selected_channels and include_fc:
-        raise ValueError("selected_channels includes 'FC' but fc_matrices is None")
-    
-    feature_list = []
-    channel_info = []
-    
-    for ch_name in selected_channels:
-        if smri_channels_dict is not None and ch_name in smri_channels_dict:
-            feature_list.append(smri_channels_dict[ch_name])
-            channel_info.append(f"{ch_name}({smri_channels_dict[ch_name].shape[2]})")
-        elif fmri_channels_dict is not None and ch_name in fmri_channels_dict:
-            feature_list.append(fmri_channels_dict[ch_name])
-            channel_info.append(f"{ch_name}({fmri_channels_dict[ch_name].shape[2]})")
-        elif ch_name == "FC" and include_fc and fc_matrices is not None:
-            feature_list.append(fc_matrices)
-            channel_info.append(f"FC({fc_matrices.shape[2]})")
-        else:
-            raise ValueError(f"No features found for channel {ch_name}")
-    
-    if not feature_list:
-        raise ValueError(f"No valid channels found: {selected_channels}")
-    
-    concatenated = np.concatenate(feature_list, axis=2)
-    print(
-        "  Concatenated channels: %s => per_roi_dim = %d"
-        % (" + ".join(channel_info), concatenated.shape[2])
-    )
-    
-    return concatenated
-
-
-def smri_vit_features_cache_ready(force_recompute=False):
-    # Whether sMRI three-channel and metadata cache are complete
-    if force_recompute:
-        return False
-    required = (
-        "smri_GM_vit_features.npy",
-        "smri_WM_vit_features.npy",
-        "smri_CSF_vit_features.npy",
-        "smri_roi_voxel_info.json",
-    )
-    return all(os.path.isfile(os.path.join(FEATURE_DIR, name)) for name in required)
-
-
-# Main classification function
-
-def run_classification_experiment(
-    selected_channels=None,
-    combination_name=None,
-    random_state=default_random_state,
-    cv_folds=default_cv_folds,
-    data_dir=None,
-    force_recompute_features=False,
-):
-    # Load split and multimodal features -> concatenate -> inner K-fold MLP; fMRI reads cache only
-    if selected_channels is None:
-        selected_channels = list(default_channels)
-    if combination_name is None:
-        combination_name = default_combination_name
-
-    print("=" * 80)
-    print("MUSA Classification Experiment")
-    print("=" * 80)
-    print("MUSA directory: %s" % (PROJECT_ROOT,))
-    print("Combination name: %s" % (combination_name,))
-    print("Channels: %s" % (" + ".join(selected_channels),))
-    print("Random seed: %d" % (random_state,))
-    print("CV folds: %d" % (cv_folds,))
-    print("Start time: %s" % (datetime.now().strftime("%Y-%m-%d %H:%M:%S"),))
-
-    # 0. Set random seed
+    combination_name = "Fused" if fused_features is not None else "+".join(selected_channels)
+    selected_channels = None if fused_features is not None else selected_channels
+    cv_folds = 5
+    if np.min(np.bincount(labels[train_indices].astype(int))) < cv_folds:
+        raise ValueError("The training set needs at least five samples per class for 5-fold CV.")
     set_global_seed(random_state)
-    
-    # 1. Load data split
-    if data_dir is None:
-        data_dir = SCRIPT_DIR
-    
-    print("\nStep 1: Loading data split...")
-    train_indices, test_indices, labels, file_list = load_saved_data_split_only(
-        random_state, holdout_test_size
-    )
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print("\nUsing device: %s" % (device,))
-    
-    # 2.1 Load sMRI features
-    print("\nStep 2: Loading sMRI ViT features...")
-    if not smri_vit_features_cache_ready(force_recompute_features):
-        raise FileNotFoundError(
-            "Complete sMRI ViT feature cache not found (requires "
-            "smri_GM_vit_features.npy, smri_WM_vit_features.npy, "
-            "smri_CSF_vit_features.npy, and smri_roi_voxel_info.json). "
-            "Run code/extract_roi_vit_features.py first to extract imaging voxel features."
-        )
-    smri_channels_dict, _ = extract_smri_all_channels_vit_features(
-        script_dir=data_dir,
-        file_list=file_list,
-        device=device,
-        script_dir_for_save=PROJECT_ROOT,
-        force_recompute=force_recompute_features,
-    )
-    print("  ✓ sMRI channels: %s" % (list(smri_channels_dict.keys())))
-    for ch_name in selected_channels:
-        if ch_name in smri_channels_dict:
-            print("  %s feature shape: %s" % (ch_name, smri_channels_dict[ch_name].shape))
-    
-    # 2.2 Load FC matrices
-    print("\nStep 3: Loading FC matrices...")
-    fc_matrices = load_fc_matrices(data_dir, file_list)
-    print("  ✓ FC matrix shape: %s" % (fc_matrices.shape,))
-    
-    print("\nStep 4: Loading fMRI ViT features...")
-    if not fmri_vit_features_cache_ready(PROJECT_ROOT, False):
-        raise FileNotFoundError(
-            "Complete fMRI ViT feature cache not found. "
-            "Run code/extract_roi_vit_features.py first to extract imaging voxel features."
-        )
-    fmri_channels_dict = extract_fmri_all_channels_vit_features(
-        fmri_roi_voxels=None,
-        roi_voxel_counts=None,
-        roi_ids=None,
-        device=device,
-        script_dir=PROJECT_ROOT,
-        force_recompute=False,
-    )
-    print("  ✓ Loaded saved fMRI ViT features")
-    
-    for ch_name in selected_channels:
-        if ch_name in fmri_channels_dict:
-            print("  %s feature shape: %s" % (ch_name, fmri_channels_dict[ch_name].shape))
-    
-    # 3. Concatenate features
-    print("\nStep 5: Concatenating features...")
-    concatenated = concatenate_selected_channels(
-        smri_channels_dict,
-        fc_matrices,
-        fmri_channels_dict,
-        selected_channels,
-        include_fc=True,
-    )
-    print("  Concatenated feature shape: %s" % (concatenated.shape,))  # [N, 116, per_roi_dim]
-    
+    print(f"Feature shape: {concatenated.shape}, device: {device}, seed: {random_state}")
+    predictions = []
+
     # 4. Inner cross-validation classification
     print("\n" + "=" * 80)
     print("Starting inner %d-fold cross-validation" % (cv_folds))
@@ -243,13 +136,19 @@ def run_classification_experiment(
             enable_early_stop=True,
         )
 
+        predictions.extend(
+            (fold, idx, sample_ids[idx], int(labels[idx]), prediction, probability)
+            for idx, prediction, probability in zip(
+                test_indices, metrics["predicted_labels"], metrics["mdd_probabilities"]
+            )
+        )
         sensitivity = metrics.get("sensitivity")
         specificity = metrics.get("specificity")
         precision = metrics.get("precision")
         confusion_matrix = metrics.get("confusion_matrix")
 
         print(
-            "  ✓ Fold %d: ACC=%.4f, SEN=%.4f, SPE=%.4f, PRE=%.4f, F1=%.4f, AUC=%.4f"
+            "  Fold %d: ACC=%.4f, SEN=%.4f, SPE=%.4f, PRE=%.4f, F1=%.4f, AUC=%.4f"
             % (
                 fold,
                 float(accuracy),
@@ -317,20 +216,20 @@ def run_classification_experiment(
         spe_mean, spe_std = mean_std(spes)
         pre_mean, pre_std = mean_std(pres)
         
-        print("ACC: %.4f ± %.4f (%.2f%% ± %.2f%%)" % (acc_mean,
+        print("ACC: %.4f +/- %.4f (%.2f%% +/- %.2f%%)" % (acc_mean,
             acc_std,
             acc_mean * 100.0,
             acc_std * 100.0))
         if sen_mean is not None:
-            print("SEN: %.4f ± %.4f" % (sen_mean, sen_std))
+            print("SEN: %.4f +/- %.4f" % (sen_mean, sen_std))
         if spe_mean is not None:
-            print("SPE: %.4f ± %.4f" % (spe_mean, spe_std))
+            print("SPE: %.4f +/- %.4f" % (spe_mean, spe_std))
         if pre_mean is not None:
-            print("PRE: %.4f ± %.4f" % (pre_mean, pre_std))
+            print("PRE: %.4f +/- %.4f" % (pre_mean, pre_std))
         if f1_mean is not None:
-            print("F1 : %.4f ± %.4f" % (f1_mean, f1_std))
+            print("F1 : %.4f +/- %.4f" % (f1_mean, f1_std))
         if auc_mean is not None:
-            print("AUC: %.4f ± %.4f" % (auc_mean, auc_std))
+            print("AUC: %.4f +/- %.4f" % (auc_mean, auc_std))
         
         summary_metrics = {
             "accuracy": {"mean": acc_mean, "std": acc_std},
@@ -348,17 +247,17 @@ def run_classification_experiment(
     os.makedirs(RESULT_DIR, exist_ok=True)
     result_file = os.path.join(
         RESULT_DIR,
-        f"classification_{combination_name}_seed{random_state}_holdout80_inner{cv_folds}fold.json",
+        f"classification_{combination_name}_seed{random_state}_inner{cv_folds}fold.json",
     )
     
     output_data = {
-        "experiment_name": f"Classification: {' + '.join(selected_channels)}",
+        "experiment_name": f"Classification: {combination_name}",
         "combination_name": combination_name,
         "channels": selected_channels,
         "random_state": random_state,
         "cv_folds": cv_folds,
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "musa_dir": PROJECT_ROOT,
+        "features": str(fused_features) if fused_features is not None else None,
         "fold_results": fold_results,
         "summary_metrics": summary_metrics,
     }
@@ -366,8 +265,15 @@ def run_classification_experiment(
     with open(result_file, "w", encoding="utf-8") as f:
         json.dump(output_data, f, ensure_ascii=False, indent=2)
     
-    print("\n✓ Experiment results saved to: %s" % (result_file))
-    print("✓ Experiment completed, end time: %s" % (datetime.now().strftime("%Y-%m-%d %H:%M:%S"),))
+    prediction_file = Path(result_file).with_suffix(".csv")
+    with prediction_file.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["fold", "row_index", "sample_id", "true_label", "predicted_label", "mdd_probability"])
+        writer.writerows(predictions)
+
+    print(f"Predictions saved to: {prediction_file}")
+    print("\nExperiment results saved to: %s" % (result_file))
+    print("Experiment completed, end time: %s" % (datetime.now().strftime("%Y-%m-%d %H:%M:%S"),))
     
     return output_data
 
