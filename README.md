@@ -1,285 +1,40 @@
-# MUSA
+# MUSA 分类版
 
-MUSA is a multimodal neuroimaging pipeline for binary classification of MDD vs. HC, combining:
+用已提取的特征训练原有 MLP，输出 MDD（1）与健康对照 HC（0）的分类结果。实验使用已有的独立测试集划分，并在训练集内做五折交叉验证。每折使用该折的训练子集拟合标准化器和训练 MLP，按验证集表现选择模型，再在同一个独立测试集上评估。
 
-- sMRI ROI-level 3D ViT features (`GM`, `WM`, `CSF`)
-- fMRI ROI-level 3D ViT features (`ReHo`, `DC`, `ALFF`, `VMHC`)
-- Functional connectivity (FC) matrices
+## 安装
 
-The project covers the full workflow from data splitting and ROI feature extraction to single-combination classification evaluation, using inner cross-validation on the training set and a held-out test set.
-
-## Key Features
-
-- Fixed random seed for reproducible data splits
-- ROI extraction based on the AAL116 atlas
-- ROI-level 3D ViT encoding
-- Multimodal feature concatenation (e.g. `WM+FC+ReHo+DC`)
-- 5-fold inner cross-validation on the training set + independent test-set evaluation
-- Results exported automatically as JSON for review and analysis
-
-## Project Structure
-
-```text
-MUSA/
-├─ code/
-│  ├─ data_split_and_paths.py           # step 1: stratified split and cache
-│  ├─ extract_roi_vit_features.py       # step 2: ROI voxel + ViT feature extraction
-│  ├─ classify_single_combo.py          # step 3: single combination classification
-│  └─ network/
-│     └─ mua_common.py                  # shared models/utilities (ViT, FC loader, MLP)
-├─ data/
-│  ├─ label.csv
-│  ├─ AAL116.nii
-│  ├─ sMRI/
-│  │  ├─ GM/ | WM/ | CSF/ 
-│  ├─ fMRI/
-│  │  ├─ ALFF/
-│  │  ├─ DC/
-│  │  ├─ ReHo/
-│  │  └─ VMHC/
-│  └─ FC_matrices/
-├─ 3dvit_features/                      # extracted feature caches
-├─ results/                             # experiment outputs 
-└─ requirements.txt
-```
-
-## Requirements
-
-- Python `3.10+` (recommended: `3.10` or `3.11`)
-- Linux/macOS (Windows paths may need manual adjustment)
-- NVIDIA GPU recommended for faster ROI feature extraction; CPU is supported but slower
-
-### Recommended: virtual environment
-
-`venv`:
+建议使用 Python 3.10 或 3.11。在仓库根目录执行：
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 ```
 
-Or `conda`:
+程序优先使用可用的 CUDA，也支持 CPU。默认的全量特征训练需要充足内存。
+
+## 输入一个已融合的特征文件
 
 ```bash
-conda create -n musa python=3.10 -y
-conda activate musa
-python -m pip install --upgrade pip
+python code/classify_single_combo.py --features path/to/final_features.npy
 ```
 
-### Install dependencies (GPU, CUDA 12.1)
+- `final_features.npy`：数值数组，形状为 `[N, D]`（已展平）或 `[N, 116, D]`（按 ROI 保存）。复现原默认组合时，请按 `WM → FC → ReHo → DC` 的顺序在最后一维拼接，再保存或按行展平。
+- `data/labels.npy`：一维标签数组，`0=HC`，`1=MDD`。
+- `data/data_split.npy`：原实验缓存，包含 `train_indices`、`test_indices` 和 `random_state`。程序沿用其中的索引和随机种子。此缓存使用 Python pickle，请使用你信任的原实验文件。
+- `data/file_list.npy`：可选的原始样本路径列表，用于在预测 CSV 中显示样本 ID。省略时输出特征行索引。请使用可信文件。
 
-```bash
-pip install -r requirements.txt
-```
+特征、标签及样本列表必须沿用同一行序。输入已融合特征时无需准备原始 MRI、图谱、分通道缓存或单独的 FC 文件。可用 `--data-dir` 指定标签与划分目录。
 
-> `requirements.txt` currently pins `torch==2.2.1+cu121` for CUDA 12.1.  
-> If your CUDA version differs, install a matching PyTorch build first, then install the remaining packages.
-
-Example (install PyTorch first, then other packages):
-
-```bash
-# Example: CUDA 12.1
-pip install torch==2.2.1+cu121 --index-url https://download.pytorch.org/whl/cu121
-# Then install remaining dependencies (avoid reinstalling torch)
-pip install numpy==1.26.4 pandas==2.3.3 scipy==1.17.0 scikit-learn==1.8.0 nibabel==5.3.3 tqdm==4.67.1
-```
-
-### CPU-only install (no NVIDIA GPU)
-
-```bash
-pip install torch==2.2.1 --index-url https://download.pytorch.org/whl/cpu
-pip install numpy==1.26.4 pandas==2.3.3 scipy==1.17.0 scikit-learn==1.8.0 nibabel==5.3.3 tqdm==4.67.1
-```
-
-### Quick sanity check after install
-
-```bash
-python -c "import numpy,pandas,scipy,sklearn,nibabel,tqdm; print('Dependencies imported successfully')"
-```
-
-## Data Layout
-
-### 1) Label file
-
-`data/label.csv` must contain:
-
-- `ID`: sample ID (must match image filename stem)
-- `label`: class (`0` for HC, `1` for MDD)
-
-Example:
-
-```csv
-ID,label
-S1-1-0001,1
-S1-1-0002,1
-```
-
-### 2) sMRI data
-
-- Expected under `data/sMRI/`
-- Preferred channel directories: `GM`, `WM`, `CSF`
-- Filename stem must match `label.csv` `ID`, e.g.:
-  - `data/sMRI/WM/S1-1-0001.nii.gz`
-
-### 3) fMRI data
-
-Expected directories and naming patterns:
-
-- `data/fMRI/ALFF/ALFFMap_{ID}.nii.gz`
-- `data/fMRI/DC/DegreeCentrality_PositiveWeightedSumBrainMap_{ID}.nii.gz`
-- `data/fMRI/ReHo/ReHoMap_{ID}.nii.gz`
-- `data/fMRI/VMHC/zVMHCMap_{ID}.nii.gz` (or `VMHCMap_{ID}.nii.gz`)
-
-### 4) FC matrices
-
-`data/FC_matrices/` must contain one `.mat` file per sample:
-
-- Filename: `{ID}.mat`
-- Matrix key in `.mat`: `FC`
-- Matrix shape: `(116, 116)`
-
-### 5) Brain atlas
-
-- `data/AAL116.nii` is required for ROI extraction.
-
-## Quick Start
-
-Run from the repository root (`MUSA`).
-
-### Step 1: Generate train/test split cache
-
-```bash
-python code/data_split_and_paths.py
-```
-
-Outputs:
-
-- `data/data_split.npy`
-- `data/labels.npy`
-- `data/file_list.npy`
-
-### Step 2: Extract ROI ViT features
-
-```bash
-python code/extract_roi_vit_features.py
-```
-
-Outputs (under `3dvit_features/`):
-
-- `smri_GM_vit_features.npy`
-- `smri_WM_vit_features.npy`
-- `smri_CSF_vit_features.npy`
-- `fmri_ReHo_vit_features.npy`
-- `fmri_DC_vit_features.npy`
-- `fmri_ALFF_vit_features.npy`
-- `fmri_VMHC_vit_features.npy`
-- `smri_roi_voxel_info.json`
-- `fmri_roi_voxel_info.json`
-
-### Step 3: Run single-combination classification
+## 使用已有的分通道缓存
 
 ```bash
 python code/classify_single_combo.py
 ```
 
-Default experiment settings:
+默认读取 `3dvit_features/` 中的 `smri_WM_vit_features.npy`、`fmri_ReHo_vit_features.npy`、`fmri_DC_vit_features.npy`，以及 `data/FC_matrices/` 中对应样本的 `.mat` 或 `.mat.gz` 文件（键 `FC`，大小 `116 × 116`）。使用 FC 时，需提供与特征行对齐的 `data/file_list.npy`。这些缓存中的 NIfTI 路径只用于提取样本 ID。按需使用 `--feature-dir` 和 `--channels` 切换目录与组合，例如 `--channels GM WM`。
 
-- Combination: `WM+FC+ReHo+DC`
-- Seed: `42`
-- Holdout test size: `0.2`
-- Inner CV folds: `5`
+[原仓库的 ViT 特征下载目录](https://drive.google.com/drive/folders/16lA0-9cZI0YnA7fe0Gz6856OewzHc9zi?usp=sharing)
 
-Results are saved to `results/`, e.g.:
+## 输出
 
-- `classification_WM+FC+ReHo+DC_seed42_holdout80_inner5fold.json`
-
-## Quick Run with Pre-extracted Features (Skip ROI ViT Extraction)
-
-If `3dvit_features/` already contains **all 9 feature cache files**, you can skip the time-consuming Step 2 (ROI ViT extraction) and run classification directly. This path is suitable when you have no GPU or want to reproduce classification results quickly.
-
-### Download pre-extracted features
-
-Pre-extracted ViT features are available on Google Drive. Download and place them under `3dvit_features/` at the project root:
-
-**[3dvit_features - Google Drive](https://drive.google.com/drive/folders/16lA0-9cZI0YnA7fe0Gz6856OewzHc9zi?usp=sharing)**
-
-Steps:
-
-1. Open the link above and download all files in the folder (or download individually).
-2. Place the files in `MUSA/3dvit_features/` (same level as `code/` and `data/`).
-3. Verify that all 9 files listed below are present.
-
-### Required files
-
-`3dvit_features/` must contain the following (all required):
-
-| File | Description |
-|------|-------------|
-| `smri_GM_vit_features.npy` | sMRI GM channel ViT features |
-| `smri_WM_vit_features.npy` | sMRI WM channel ViT features |
-| `smri_CSF_vit_features.npy` | sMRI CSF channel ViT features |
-| `fmri_ReHo_vit_features.npy` | fMRI ReHo channel ViT features |
-| `fmri_DC_vit_features.npy` | fMRI DC channel ViT features |
-| `fmri_ALFF_vit_features.npy` | fMRI ALFF channel ViT features |
-| `fmri_VMHC_vit_features.npy` | fMRI VMHC channel ViT features |
-| `smri_roi_voxel_info.json` | sMRI ROI voxel metadata |
-| `fmri_roi_voxel_info.json` | fMRI ROI voxel metadata |
-
-### Workflow when features are complete
-
-You still need labels, FC matrices, and the data-split cache under `data/`. **Raw sMRI/fMRI images are not required for classification**, but sMRI file paths are still needed when generating the split so they can be aligned with `label.csv`.
-
-```bash
-# 1. Install dependencies (see Requirements above)
-pip install -r requirements.txt
-
-# 2. Generate train/test split (must match the sample set used for pre-extracted features)
-python code/data_split_and_paths.py
-
-# 3. Skip feature extraction — this command auto-skips when cache is complete
-python code/extract_roi_vit_features.py
-# Look for "Feature cache is complete; skipping ..." in the terminal
-
-# 4. Run classification
-python code/classify_single_combo.py
-```
-
-**Notes:**
-
-- Pre-extracted features are tied to a specific sample set and the order in `file_list.npy`. Use the **same** `data/label.csv` and sMRI naming as when the features were generated.
-- Classification still requires FC matrices for every sample under `data/FC_matrices/` (`.mat` files, key `FC`, shape `(116, 116)`).
-- Step 3 classification is MLP-based and runs on CPU; a GPU speeds up training.
-- If a `.npy` file is missing or corrupted, set `default_force_recompute_features = True` in `code/extract_roi_vit_features.py` and re-run Step 2 to force recomputation.
-
-## Reproducibility
-
-- Main scripts fix the random seed (default `set_global_seed(42)`).
-- If feature cache already exists, the extraction script skips recomputation. To force re-extraction, set:
-  - `default_force_recompute_features = True`
-
-## Configuration
-
-Most parameters are set as script constants (not CLI flags). Edit as needed:
-
-- `code/classify_single_combo.py`
-  - `default_channels`
-  - `default_combination_name`
-  - `default_random_state`
-  - `default_cv_folds`
-- `code/extract_roi_vit_features.py`
-  - `default_force_recompute_features`
-
-## FAQ
-
-- `FileNotFoundError: AAL116 atlas file not found`  
-  Ensure `data/AAL116.nii` exists (only needed when extracting features yourself).
-
-- `FC matrices directory not found` or FC shape/key mismatch  
-  Check `data/FC_matrices/`; each file must contain key `FC` with shape `(116, 116)`.
-
-- sMRI/fMRI file not found for a sample ID  
-  Ensure image filename stems exactly match `ID` in `label.csv`.
-
-- GPU memory pressure during extraction  
-  Use a GPU with more VRAM, or reduce batch-size parameters in the extraction code.
+`results/` 下生成同名的 JSON 和 CSV 文件。JSON 保存五折的 ACC、AUC、F1、灵敏度、特异度、精确率、混淆矩阵和汇总统计。CSV 保存每一折在独立测试集上的样本 ID、真实标签、预测标签和 MDD 概率。
