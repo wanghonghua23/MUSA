@@ -143,7 +143,7 @@ def flatten_and_classify_mlp(features, labels, train_indices, test_indices, meth
         improved = val_loss_val < best_val_loss - early_stop_min_delta
         if improved:
             best_val_loss = val_loss_val
-                                    patience_counter = 0
+            patience_counter = 0
             best_state = {
                 'model': model.state_dict(),
                 'optimizer': optimizer.state_dict(),
