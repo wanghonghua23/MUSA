@@ -181,7 +181,7 @@ def flatten_and_classify_mlp(features, labels, train_indices, test_indices, meth
     best_val_auc = 0.0
     patience_counter = 0
     best_state = None
-    checkpoints = []
+    best_checkpoint = None
     
     from torch.utils.data import TensorDataset, DataLoader
     train_dataset = TensorDataset(X_train, y_train)
@@ -234,28 +234,12 @@ def flatten_and_classify_mlp(features, labels, train_indices, test_indices, meth
             patience_counter += 1
         
         if use_multi_checkpoint and (epoch + 1) % checkpoint_interval == 0:
-            model.eval()
-            with torch.no_grad():
-                val_outputs_checkpoint = model(X_val)
-                val_probs_checkpoint = torch.softmax(val_outputs_checkpoint, dim=1)
-                val_pred_checkpoint = val_outputs_checkpoint.argmax(dim=1).cpu().numpy()
-                val_prob_checkpoint = val_probs_checkpoint[:, 1].cpu().numpy()
-                
-                val_acc_checkpoint = accuracy_score(y_val.cpu().numpy(), val_pred_checkpoint)
-                val_f1_checkpoint = f1_score(y_val.cpu().numpy(), val_pred_checkpoint)
-                val_auc_checkpoint = roc_auc_score(y_val.cpu().numpy(), val_prob_checkpoint)
-            
-            checkpoint_state = {
-                'model': {k: v.detach().cpu().clone() for k, v in model.state_dict().items()},
-                'optimizer': {k: v for k, v in optimizer.state_dict().items()},
-                'scheduler': {k: v for k, v in scheduler.state_dict().items()},
-                'epoch': epoch + 1,
-                'val_loss': val_loss_val,
-                'val_acc': val_acc_checkpoint,
-                'val_f1': val_f1_checkpoint,
-                'val_auc': val_auc_checkpoint,
-            }
-            checkpoints.append(checkpoint_state)
+            if best_checkpoint is None or val_acc > best_checkpoint["val_acc"]:
+                best_checkpoint = {
+                    "model": {key: value.detach().cpu().clone()
+                              for key, value in model.state_dict().items()},
+                    "val_acc": val_acc,
+                }
             model.train()
         
         if enable_early_stop and patience_counter >= early_stop_patience:
@@ -263,8 +247,7 @@ def flatten_and_classify_mlp(features, labels, train_indices, test_indices, meth
         
         model.train()
     
-    if use_multi_checkpoint and len(checkpoints) > 0:
-        best_checkpoint = max(checkpoints, key=lambda x: x['val_acc'])
+    if best_checkpoint is not None:
         model.load_state_dict(best_checkpoint['model'])
         
         model.eval()
